@@ -1,0 +1,5 @@
+dotenv
+discord
+requests
+Pillow
+python-dateutil
