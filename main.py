@@ -2,10 +2,11 @@ import discord
 import requests
 import os
 import re
+import piexif # ← EXIF操作用ライブラリ
 from io import BytesIO
 from datetime import timezone, timedelta, datetime
 from dotenv import load_dotenv
-from PIL import Image, ExifTags
+from PIL import Image
 from dateutil import parser 
 
 load_dotenv()
@@ -31,63 +32,28 @@ TARGET_EXTENSIONS = [
 
 JST = timezone(timedelta(hours=9), 'JST')
 
-# --- 1. ファイル名から日時を抽出する関数（JST計算後にTZ情報を削除） ---
+# --- 日時抽出ロジック (JST時間を返す) ---
 def get_date_from_filename(filename):
-    # 【ステップ1】 Pixel形式 (UTC) -> JST数値に変換してTZ削除
+    # A. Pixel形式 (UTC -> JST)
     pixel_pattern = r'PXL_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})'
     match = re.search(pixel_pattern, filename)
-    
     if match:
         try:
             y, m, d, H, M, S = map(int, match.groups())
             dt_utc = datetime(y, m, d, H, M, S, tzinfo=timezone.utc)
-            
-            # UTCからJSTに変換し、その直後に「タイムゾーン情報だけ」を消す
-            # 結果: 2025-10-11 10:31:58 (という単なる数字になる)
-            dt_jst_naive = dt_utc.astimezone(JST).replace(tzinfo=None)
-            
-            return dt_jst_naive.isoformat()
+            return dt_utc.astimezone(JST)
         except ValueError:
-            pass 
+            pass
 
-    # 【ステップ2】 その他の形式 -> そのままTZなしで返す
+    # B. 一般的な形式 (JSTとみなす)
     try:
         dt = parser.parse(filename, fuzzy=True)
-        
         current_year = discord.utils.utcnow().year + 1
         if 1990 <= dt.year <= current_year:
-            # もしparserがタイムゾーンを検知してしまった場合、JSTに合わせてから消す
-            if dt.tzinfo is not None:
-                dt = dt.astimezone(JST).replace(tzinfo=None)
-            else:
-                # タイムゾーンがない場合はそのまま使う（大抵は端末時間の数字そのままなのでOK）
-                dt = dt.replace(tzinfo=None)
-                
-            return dt.isoformat()
-            
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=JST)
+            return dt
     except (ValueError, OverflowError):
-        pass
-            
-    return None
-
-# --- 2. EXIFから日時を抽出する関数 ---
-def get_exif_date(file_stream):
-    try:
-        image = Image.open(file_stream)
-        exif = image._getexif()
-        
-        if not exif:
-            return None
-
-        # 36867: DateTimeOriginal
-        date_str = exif.get(36867) or exif.get(306)
-
-        if date_str:
-            dt = parser.parse(date_str.replace(':', '-', 2))
-            # EXIFは基本的にTZ情報を持たないので、そのまま返すだけでOK
-            return dt.replace(tzinfo=None).isoformat()
-            
-    except Exception:
         pass
     
     return None
@@ -95,7 +61,6 @@ def get_exif_date(file_stream):
 @client.event
 async def on_ready():
     print(f'ログインしました: {client.user}')
-    print(f'監視対象のチャンネルID: {TARGET_CHANNEL_ID}')
 
 @client.event
 async def on_message(message):
@@ -103,63 +68,92 @@ async def on_message(message):
         return
 
     if message.channel.id == TARGET_CHANNEL_ID:
-        # 投稿日時も JST に変換したあと、TZ情報を削除する
-        jst_time = message.created_at.astimezone(JST).replace(tzinfo=None)
+        jst_now = message.created_at.astimezone(JST)
         
         for attachment in message.attachments:
             if any(attachment.filename.lower().endswith(ext) for ext in TARGET_EXTENSIONS):
                 print(f"--- 処理開始: {attachment.filename} ---")
 
                 try:
+                    # 1. ファイルをダウンロード
                     file_data = await attachment.read()
-                    file_io = BytesIO(file_data)
                     
-                    final_date = None
-                    source_type = ""
-
-                    # 1. ファイル名解析
-                    filename_date = get_date_from_filename(attachment.filename)
-                    if filename_date:
-                        final_date = filename_date
-                        source_type = "📂 ファイル名解析(Auto)"
+                    # 2. 正しい日時を決定
+                    target_dt = get_date_from_filename(attachment.filename)
+                    source_type = "📂 ファイル名解析"
                     
-                    # 2. EXIF解析
-                    if not final_date:
-                        exif_date = get_exif_date(file_io)
-                        file_io.seek(0)
-                        if exif_date:
-                            final_date = exif_date
-                            source_type = "📷 EXIFデータ"
-                    
-                    # 3. 投稿日時
-                    if not final_date:
-                        final_date = jst_time.isoformat()
+                    if not target_dt:
+                        target_dt = jst_now
                         source_type = "🕒 Discord投稿日時"
+                    
+                    # 3. 画像ファイル(JPG)なら、EXIFを直接書き換える
+                    #    (PNGや動画はpiexifが対応していないのでスキップ)
+                    modified_file_data = file_data
+                    
+                    if attachment.filename.lower().endswith(('.jpg', '.jpeg')):
+                        try:
+                            # EXIF用フォーマット "YYYY:MM:DD HH:MM:SS"
+                            exif_time_str = target_dt.strftime("%Y:%m:%d %H:%M:%S")
+                            
+                            # 既存のEXIFを読み込む (なければ新規作成)
+                            try:
+                                exif_dict = piexif.load(file_data)
+                            except:
+                                exif_dict = {"0th":{}, "Exif":{}, "GPS":{}, "1st":{}, "thumbnail":None}
 
-                    print(f"  決定日時(Naive): {final_date} (由来: {source_type})")
+                            # DateTimeOriginal (36867) を書き換え
+                            exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = exif_time_str
+                            exif_dict['Exif'][piexif.ExifIFD.DateTimeDigitized] = exif_time_str
+                            exif_dict['0th'][piexif.ImageIFD.DateTime] = exif_time_str
 
+                            # PixelなどのOffsetTime (+00:00等) が残っていると邪魔するので削除する
+                            # これでImmichは「タイムゾーンなしの純粋な時間」として読み取る
+                            if piexif.ExifIFD.OffsetTimeOriginal in exif_dict['Exif']:
+                                del exif_dict['Exif'][piexif.ExifIFD.OffsetTimeOriginal]
+                            if piexif.ExifIFD.OffsetTime in exif_dict['Exif']:
+                                del exif_dict['Exif'][piexif.ExifIFD.OffsetTime]
+
+                            # 書き換えたEXIFをバイナリに戻す
+                            exif_bytes = piexif.dump(exif_dict)
+                            
+                            # メモリ上のファイルデータにEXIFを挿入
+                            output = BytesIO()
+                            piexif.insert(exif_bytes, file_data, output)
+                            modified_file_data = output.getvalue()
+                            
+                            print(f"  ✨ EXIF書き換え成功: {exif_time_str}")
+                            
+                        except Exception as e:
+                            print(f"  ⚠️ EXIF書き換えスキップ(破損/非対応など): {e}")
+                    
+                    # 4. アップロード準備
+                    # Immichへ送るAPI用パラメータも念のため設定 (TZなし文字列にする)
+                    naive_iso = target_dt.replace(tzinfo=None).isoformat()
+                    
                     headers = {
                         'x-api-key': API_KEY,
                         'Accept': 'application/json'
                     }
 
                     files = {
-                        'assetData': (attachment.filename, file_io, attachment.content_type)
+                        'assetData': (attachment.filename, BytesIO(modified_file_data), attachment.content_type)
                     }
 
-                    # ここで送られるのは "2025-10-11T10:31:58" のような TZなしの文字列
                     data = {
                         'deviceAssetId': f"discord-{attachment.id}",
                         'deviceId': 'discord-bot',
-                        'fileCreatedAt': final_date,
-                        'fileModifiedAt': final_date,
+                        'fileCreatedAt': naive_iso,
+                        'fileModifiedAt': naive_iso,
                         'isFavorite': 'false'
                     }
 
+                    # 5. 送信
                     response = requests.post(IMMICH_URL, headers=headers, data=data, files=files)
 
                     if response.status_code == 201:
                         await message.channel.send(f"✅ 保存完了 ({source_type}): {attachment.filename}")
+                    elif response.status_code == 409:
+                        await message.channel.send(f"⚠️ 既に保存済みです: {attachment.filename}")
                     else:
                         print(f"エラー: {response.text}")
                         await message.channel.send(f"❌ エラー ({response.status_code})")
