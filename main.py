@@ -1,12 +1,12 @@
 import discord
 import requests
 import os
-import re  # ← これが必要です！
+import re
 from io import BytesIO
 from datetime import timezone, timedelta, datetime
 from dotenv import load_dotenv
 from PIL import Image, ExifTags
-from dateutil import parser
+from dateutil import parser 
 
 load_dotenv()
 
@@ -31,47 +31,43 @@ TARGET_EXTENSIONS = [
 
 JST = timezone(timedelta(hours=9), 'JST')
 
-# --- 1. ファイル名から日時を抽出する関数（Pixel専用処理付き） ---
+# --- 1. ファイル名から日時を抽出する関数（JST計算後にTZ情報を削除） ---
 def get_date_from_filename(filename):
+    # 【ステップ1】 Pixel形式 (UTC) -> JST数値に変換してTZ削除
+    pixel_pattern = r'PXL_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})'
+    match = re.search(pixel_pattern, filename)
     
-    # ---------------------------------------------------------
-    # パターンA: Google Pixel (PXL_...) の場合 -> UTCなのでJSTに変換
-    # ---------------------------------------------------------
-    if "PXL_" in filename:
-        # PXL_YYYYMMDD_HHMMSS... の数字部分を抽出
-        pixel_pattern = r'PXL_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})'
-        match = re.search(pixel_pattern, filename)
-        
-        if match:
-            try:
-                y, m, d, H, M, S = map(int, match.groups())
-                # UTCとして定義
-                dt_utc = datetime(y, m, d, H, M, S, tzinfo=timezone.utc)
-                # JSTに変換
-                dt_jst = dt_utc.astimezone(JST)
-                return dt_jst.isoformat()
-            except ValueError:
-                pass 
+    if match:
+        try:
+            y, m, d, H, M, S = map(int, match.groups())
+            dt_utc = datetime(y, m, d, H, M, S, tzinfo=timezone.utc)
+            
+            # UTCからJSTに変換し、その直後に「タイムゾーン情報だけ」を消す
+            # 結果: 2025-10-11 10:31:58 (という単なる数字になる)
+            dt_jst_naive = dt_utc.astimezone(JST).replace(tzinfo=None)
+            
+            return dt_jst_naive.isoformat()
+        except ValueError:
+            pass 
 
-    # ---------------------------------------------------------
-    # パターンB: その他のAndroid / スクショ / Galaxy / Xiaomiなど
-    # 基本的に「端末のローカル時間(JST)」で保存されている
-    # ---------------------------------------------------------
+    # 【ステップ2】 その他の形式 -> そのままTZなしで返す
     try:
-        # dateutilで日付を抽出
         dt = parser.parse(filename, fuzzy=True)
         
         current_year = discord.utils.utcnow().year + 1
         if 1990 <= dt.year <= current_year:
-            # タイムゾーン情報がない場合は JST とみなす
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=JST)
+            # もしparserがタイムゾーンを検知してしまった場合、JSTに合わせてから消す
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(JST).replace(tzinfo=None)
+            else:
+                # タイムゾーンがない場合はそのまま使う（大抵は端末時間の数字そのままなのでOK）
+                dt = dt.replace(tzinfo=None)
+                
             return dt.isoformat()
             
     except (ValueError, OverflowError):
         pass
             
-    return None           
     return None
 
 # --- 2. EXIFから日時を抽出する関数 ---
@@ -83,14 +79,13 @@ def get_exif_date(file_stream):
         if not exif:
             return None
 
-        # 36867: DateTimeOriginal, 306: DateTime
+        # 36867: DateTimeOriginal
         date_str = exif.get(36867) or exif.get(306)
 
         if date_str:
-            # EXIFの形式を dateutil で読むことも可能ですが、ここはフォーマットが決まっているのでそのままで
-            # YYYY:MM:DD HH:MM:SS 形式
-            dt = parser.parse(date_str.replace(':', '-', 2)) # コロンをハイフンに変えてparseさせるテクニック
-            return dt.isoformat()
+            dt = parser.parse(date_str.replace(':', '-', 2))
+            # EXIFは基本的にTZ情報を持たないので、そのまま返すだけでOK
+            return dt.replace(tzinfo=None).isoformat()
             
     except Exception:
         pass
@@ -108,7 +103,8 @@ async def on_message(message):
         return
 
     if message.channel.id == TARGET_CHANNEL_ID:
-        jst_time = message.created_at.astimezone(JST)
+        # 投稿日時も JST に変換したあと、TZ情報を削除する
+        jst_time = message.created_at.astimezone(JST).replace(tzinfo=None)
         
         for attachment in message.attachments:
             if any(attachment.filename.lower().endswith(ext) for ext in TARGET_EXTENSIONS):
@@ -121,7 +117,7 @@ async def on_message(message):
                     final_date = None
                     source_type = ""
 
-                    # 1. ファイル名解析 (dateutilにお任せ)
+                    # 1. ファイル名解析
                     filename_date = get_date_from_filename(attachment.filename)
                     if filename_date:
                         final_date = filename_date
@@ -130,7 +126,7 @@ async def on_message(message):
                     # 2. EXIF解析
                     if not final_date:
                         exif_date = get_exif_date(file_io)
-                        file_io.seek(0) # ストリームリセット
+                        file_io.seek(0)
                         if exif_date:
                             final_date = exif_date
                             source_type = "📷 EXIFデータ"
@@ -140,7 +136,7 @@ async def on_message(message):
                         final_date = jst_time.isoformat()
                         source_type = "🕒 Discord投稿日時"
 
-                    print(f"  決定日時: {final_date} (由来: {source_type})")
+                    print(f"  決定日時(Naive): {final_date} (由来: {source_type})")
 
                     headers = {
                         'x-api-key': API_KEY,
@@ -151,6 +147,7 @@ async def on_message(message):
                         'assetData': (attachment.filename, file_io, attachment.content_type)
                     }
 
+                    # ここで送られるのは "2025-10-11T10:31:58" のような TZなしの文字列
                     data = {
                         'deviceAssetId': f"discord-{attachment.id}",
                         'deviceId': 'discord-bot',
