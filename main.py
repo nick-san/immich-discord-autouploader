@@ -3,6 +3,7 @@ import requests
 import os
 import re
 import piexif 
+import certifi
 from io import BytesIO
 from datetime import timezone, timedelta, datetime
 from dotenv import load_dotenv
