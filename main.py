@@ -9,6 +9,8 @@ from dotenv import load_dotenv
 from PIL import Image
 from dateutil import parser 
 
+os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
+
 load_dotenv()
 
 # --- 環境変数設定 ---
