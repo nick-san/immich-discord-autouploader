@@ -1,6 +1,6 @@
 dotenv
 discord
-requests
+aiohttp
 piexif
 Pillow
 python-dateutil
