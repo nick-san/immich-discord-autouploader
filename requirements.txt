@@ -1,6 +1,6 @@
-dotenv
-discord
-requests
+python-dotenv
+discord.py
+aiohttp
 piexif
 Pillow
 python-dateutil
